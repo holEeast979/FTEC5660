@@ -62,8 +62,49 @@ def build_chain() -> Any:
     Use the vision-capable DeepSeek Flash model named
     ``deepseek-v4-flash-vision-exp``. The API key is loaded from .env.
     """
-    ### YOUR CODE HERE
-    return None
+    from langchain_core.output_parsers import StrOutputParser
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_deepseek import ChatDeepSeek
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                """You extract totals from Hong Kong supermarket receipt images.
+Return exactly one JSON object with these fields:
+final_payment_after_rounding, subtotal_after_discounts_before_rounding, discount_total.
+Use decimal numbers with two digits after the decimal point and no currency symbols.
+
+Rules:
+- final_payment_after_rounding is the amount actually paid after any ROUNDING line. Use the final amount charged, not the subtotal or amount tendered before change.
+- subtotal_after_discounts_before_rounding is the receipt subtotal after discounts and before rounding.
+- discount_total is the positive sum of all discounts, promotions, coupons, membership or app savings, and other price reductions on the receipt.
+- Exclude ROUNDING, payment/tender, change, stored-value balance, and loyalty-point information from discount_total.
+- Count each discount once. If a discount is repeated in a summary, do not add that duplicate again.
+- If there are no discounts, use 0.00. Read the printed amounts carefully; do not estimate.
+- Return JSON only, with no markdown or explanation.""",
+            ),
+            (
+                "human",
+                [
+                    {
+                        "type": "text",
+                        "text": "Extract the three amounts from this receipt image.",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "{image_url}"},
+                    },
+                ],
+            ),
+        ]
+    )
+    model = ChatDeepSeek(
+        model="deepseek-v4-flash-vision-exp",
+        temperature=0,
+        max_tokens=8192,
+    )
+    return prompt | model | StrOutputParser()
 
 
 def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
@@ -78,9 +119,70 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
     multimodal human messages. LangChain's ``batch`` method is one simple way
     to process independent receipt-extraction prompts in parallel.
     """
-    ### YOUR CODE HERE
-    _ = (chain, images)
-    return {QUERY_1: DUMMY_RESPONSE, QUERY_2: DUMMY_RESPONSE}
+    if not images:
+        raise ValueError("At least one receipt image is required")
+
+    inputs = [{"image_url": image_data_url(path)} for path in images]
+    outputs = chain.batch(
+        inputs,
+        config={"max_concurrency": min(3, len(inputs))},
+    )
+    if len(outputs) != len(images):
+        raise RuntimeError(
+            f"Expected {len(images)} receipt responses, received {len(outputs)}"
+        )
+
+    def read_amount(data: dict[str, Any], key: str, image: Path) -> Decimal:
+        if key not in data:
+            raise ValueError(f"{image.name}: model response is missing {key}")
+        raw_value = str(data[key])
+        match = re.search(r"-?\d[\d,]*(?:\.\d+)?", raw_value)
+        if match is None:
+            raise ValueError(f"{image.name}: invalid amount for {key}")
+        try:
+            return Decimal(match.group(0).replace(",", "")).quantize(
+                Decimal("0.01")
+            )
+        except InvalidOperation as exc:
+            raise ValueError(f"{image.name}: invalid amount for {key}") from exc
+
+    def parse_response(output: Any, image: Path) -> dict[str, Any]:
+        text = str(output).strip()
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end < start:
+            raise ValueError(f"{image.name}: model response did not contain JSON")
+        try:
+            data = json.loads(text[start : end + 1])
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{image.name}: model returned invalid JSON") from exc
+        if not isinstance(data, dict):
+            raise ValueError(f"{image.name}: model response must be a JSON object")
+        return data
+
+    spent_total = Decimal("0.00")
+    pre_discount_total = Decimal("0.00")
+    for image, output in zip(images, outputs):
+        for attempt in range(3):
+            try:
+                data = parse_response(output, image)
+                break
+            except ValueError:
+                if attempt == 2:
+                    raise
+                output = chain.invoke({"image_url": image_data_url(image)})
+
+        paid = read_amount(data, "final_payment_after_rounding", image)
+        subtotal = read_amount(
+            data, "subtotal_after_discounts_before_rounding", image
+        )
+        discounts = abs(read_amount(data, "discount_total", image))
+        spent_total += paid
+        pre_discount_total += subtotal + discounts
+
+    return {
+        QUERY_1: f"HK${spent_total:.2f}",
+        QUERY_2: f"HK${pre_discount_total:.2f}",
+    }
 
 
 # Everything below is provided runner/scoring code. No edits are needed.

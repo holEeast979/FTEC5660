@@ -48,6 +48,19 @@ DeepSeek Flash model. JPEG, PNG, GIF, and WebP inputs are accepted by the
 homework runner.
 
 
-## Homework 1 solution: 
-> to students: please fill your solution description here.
+## Homework 1 solution
 
+### Chain design
+
+```mermaid
+flowchart LR
+    A[Receipt images] --> B[Encode images as data URLs]
+    B --> C[LangChain prompt]
+    C --> D[DeepSeek V4 Flash Vision]
+    D --> E[JSON amounts per receipt]
+    E --> F[Aggregate with Decimal]
+    F --> G[One HKD amount for each question]
+    G --> H[Provided runner writes results.csv]
+```
+
+For each receipt, the LangChain prompt sends the image to `deepseek-v4-flash-vision-exp` and requests the final payment after rounding, the discounted subtotal before rounding, and the positive total of discounts. The model processes receipts in small parallel batches; a receipt is retried up to twice if its response is not valid JSON. Python parses the returned amounts and uses `Decimal` to sum actual payments for the first question and each subtotal plus its discounts for the second question. This keeps currency arithmetic deterministic and returns one HKD amount for each required query.
